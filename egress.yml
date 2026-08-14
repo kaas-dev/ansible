@@ -1,0 +1,125 @@
+---
+- name: Configure KaaS delegated HTTP egress
+  hosts: colima_vms
+  become: false
+  tasks:
+    - name: Resolve proxy host to one IPv4 address
+      ansible.builtin.shell: "getent ahostsv4 {{ egress_proxy_host | quote }} | awk 'NR==1 {print $1}'"
+      register: egress_proxy_ip_result
+      changed_when: false
+      failed_when: egress_proxy_ip_result.stdout | trim == ''
+
+    - name: Install proxy public CA
+      ansible.builtin.copy:
+        src: "{{ egress_ca_file }}"
+        dest: /usr/local/share/ca-certificates/kaas-egress.crt
+        mode: "0644"
+      become: true
+      notify: Update trusted certificates
+
+    - name: Ensure profile.d directory exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.profile.d"
+        state: directory
+        mode: "0755"
+
+    - name: Install non-secret proxy environment
+      ansible.builtin.copy:
+        dest: "{{ home_dir }}/.profile.d/kaas-egress.sh"
+        mode: "0644"
+        content: |
+          # Managed by KaaS. Contains no resolved credential values.
+          export HTTP_PROXY={{ egress_proxy_url | quote }}
+          export HTTPS_PROXY={{ egress_proxy_url | quote }}
+          export http_proxy={{ egress_proxy_url | quote }}
+          export https_proxy={{ egress_proxy_url | quote }}
+          export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/kaas-egress.crt
+          {% for key in egress_placeholder_keys | default([]) %}
+          export {{ key }}=kaas-delegated-placeholder
+          {% endfor %}
+
+    - name: Source egress environment from shell profiles
+      ansible.builtin.blockinfile:
+        path: "{{ item }}"
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED KAAS EGRESS"
+        block: |
+          [ ! -f "$HOME/.profile.d/kaas-egress.sh" ] || . "$HOME/.profile.d/kaas-egress.sh"
+      loop:
+        - "{{ bashrc_path }}"
+        - "{{ home_dir }}/.profile"
+
+    - name: Install nftables
+      ansible.builtin.apt:
+        name: nftables
+        state: present
+      become: true
+      when: egress_mode == 'proxy_only'
+
+    - name: Ensure nftables include directory is persistent
+      ansible.builtin.lineinfile:
+        path: /etc/nftables.conf
+        line: 'include "/etc/nftables.d/*.nft"'
+        create: true
+        mode: "0755"
+      become: true
+      when: egress_mode == 'proxy_only'
+
+    - name: Ensure nftables include directory exists
+      ansible.builtin.file:
+        path: /etc/nftables.d
+        state: directory
+        mode: "0755"
+      become: true
+      when: egress_mode == 'proxy_only'
+
+    - name: Install proxy-only nftables rules
+      ansible.builtin.copy:
+        dest: /etc/nftables.d/kaas-egress.nft
+        mode: "0600"
+        content: |
+          table inet kaas_egress {
+            chain output {
+              type filter hook output priority -10; policy drop;
+              oifname "lo" accept
+              tcp sport 22 ct state established ct direction reply accept
+              ip daddr {{ egress_proxy_ip_result.stdout | trim }} tcp dport {{ egress_proxy_port }} ct state new,established ct direction original accept
+            }
+            chain forward {
+              type filter hook forward priority -10; policy drop;
+              ip daddr {{ egress_proxy_ip_result.stdout | trim }} tcp dport {{ egress_proxy_port }} ct state new,established ct direction original accept
+              ip saddr {{ egress_proxy_ip_result.stdout | trim }} tcp sport {{ egress_proxy_port }} ct state established ct direction reply accept
+            }
+          }
+      become: true
+      when: egress_mode == 'proxy_only'
+
+    - name: Atomically activate proxy-only nftables rules
+      ansible.builtin.shell: |
+        nft -c -f /etc/nftables.d/kaas-egress.nft
+        nft delete table inet kaas_egress 2>/dev/null || true
+        nft -f /etc/nftables.d/kaas-egress.nft
+      become: true
+      changed_when: true
+      when: egress_mode == 'proxy_only'
+
+    - name: Verify proxy-only rules have a drop policy and proxy exception
+      ansible.builtin.shell: |
+        set -eu
+        nft list table inet kaas_egress | grep -q 'policy drop'
+        nft list table inet kaas_egress | grep -q {{ egress_proxy_port | quote }}
+      become: true
+      changed_when: false
+      when: egress_mode == 'proxy_only'
+
+    - name: Enable persistent proxy-only enforcement
+      ansible.builtin.systemd:
+        name: nftables
+        enabled: true
+      become: true
+      when: egress_mode == 'proxy_only'
+
+  handlers:
+    - name: Update trusted certificates
+      ansible.builtin.command: update-ca-certificates
+      become: true

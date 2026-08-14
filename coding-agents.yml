@@ -1,0 +1,113 @@
+---
+# Install terminal coding agents on a provisioned Colima VM.
+# Requires Node.js (from setup.yml) for pi; omp uses the official install script.
+# Usage:
+#   cd ansible && ansible-playbook coding-agents.yml
+#   make agents
+# Skip individual agents: -e install_pi=false -e install_oh_my_pi=false -e install_prime_agent=false
+- name: Install coding agents
+  hosts: colima_vms
+  become: false
+
+  tasks:
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Ensure ~/.local/bin exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.local/bin"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure ~/.local/bin is on PATH
+      ansible.builtin.blockinfile:
+        path: "{{ bashrc_path }}"
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED LOCAL BIN"
+        block: |
+          export PATH="$HOME/.local/bin:$PATH"
+
+    - name: Require Node.js for npm-based agents
+      ansible.builtin.command: node --version
+      register: node_check
+      changed_when: false
+      failed_when: >-
+        install_pi | bool and node_check.rc != 0
+      when: install_pi | bool
+
+    # --- Pi (pi.dev) ---
+    - name: Check for pi CLI
+      ansible.builtin.command: pi --version
+      environment:
+        PATH: "{{ home_dir }}/.local/bin:/usr/local/bin:{{ ansible_facts['env']['PATH'] }}"
+      register: pi_check
+      changed_when: false
+      failed_when: false
+      when: install_pi | bool
+
+    - name: Install Pi coding agent (npm)
+      ansible.builtin.command: >-
+        npm install -g --ignore-scripts {{ pi_npm_package }}
+      become: true
+      when: install_pi | bool and pi_check.rc != 0
+      changed_when: true
+
+    # --- Prime Agent ---
+    - name: Check for Prime Agent CLI
+      ansible.builtin.command: prime-agent --version
+      environment:
+        PATH: "{{ home_dir }}/.local/bin:/usr/local/bin:{{ ansible_facts['env']['PATH'] }}"
+      register: prime_agent_check
+      changed_when: false
+      failed_when: false
+      when: install_prime_agent | bool
+
+    - name: Install Prime Agent
+      ansible.builtin.shell: >-
+        curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "{{ home_dir }}"
+        PATH: "{{ home_dir }}/.local/bin:{{ ansible_facts['env']['PATH'] }}"
+        npm_config_prefix: "{{ home_dir }}/.local"
+      when: install_prime_agent | bool and prime_agent_check.rc != 0
+      changed_when: true
+
+    # --- Oh My Pi (omp) ---
+    - name: Check for omp CLI
+      ansible.builtin.command: omp --version
+      environment:
+        PATH: "{{ home_dir }}/.local/bin:/usr/local/bin:{{ ansible_facts['env']['PATH'] }}"
+      register: omp_check
+      changed_when: false
+      failed_when: false
+      when: install_oh_my_pi | bool
+
+    - name: Install Oh My Pi (omp)
+      ansible.builtin.shell: curl -fsSL https://omp.sh/install | sh
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "{{ home_dir }}"
+        PATH: "{{ home_dir }}/.local/bin:{{ ansible_facts['env']['PATH'] }}"
+      when: install_oh_my_pi | bool and omp_check.rc != 0
+      changed_when: true
+
+    - name: Verify coding agents
+      ansible.builtin.shell: |
+        set -e
+        export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+        echo "pi:  $(command -v pi >/dev/null && pi --version 2>/dev/null || echo 'not installed')"
+        echo "omp: $(command -v omp >/dev/null && omp --version 2>/dev/null || echo 'not installed')"
+        echo "prime-agent: $(command -v prime-agent >/dev/null && prime-agent --version 2>/dev/null || echo 'not installed')"
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "{{ home_dir }}"
+      register: agent_versions
+      changed_when: false
+
+    - name: Print coding agent versions
+      ansible.builtin.debug:
+        var: agent_versions.stdout_lines

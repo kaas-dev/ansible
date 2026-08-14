@@ -1,0 +1,41 @@
+---
+# Generate an SSH key on the sandbox VM (if missing) and print the public key.
+# Usage:
+#   make pubkey
+#   cd ansible && ansible-playbook pubkey.yml
+- name: Generate and print sandbox SSH public key
+  hosts: colima_vms
+  become: false
+
+  tasks:
+    - name: Ensure ~/.ssh directory exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Check for existing private key
+      ansible.builtin.stat:
+        path: "{{ sandbox_ssh_key }}"
+      register: sandbox_key
+
+    - name: Generate ed25519 SSH keypair
+      ansible.builtin.command: >-
+        ssh-keygen -t ed25519 -N '' -C {{ sandbox_ssh_key_comment | quote }}
+        -f {{ sandbox_ssh_key | quote }}
+      when: not sandbox_key.stat.exists
+      changed_when: true
+
+    - name: Read public key
+      ansible.builtin.slurp:
+        src: "{{ sandbox_ssh_key }}.pub"
+      register: sandbox_pubkey
+
+    - name: Print public key
+      ansible.builtin.debug:
+        msg:
+          - "Add this public key to GitHub (Settings → SSH keys) or use with gh:"
+          - "{{ sandbox_pubkey.content | b64decode | trim }}"
+          - ""
+          - "Private key: {{ sandbox_ssh_key }}"
+          - "Public key:  {{ sandbox_ssh_key }}.pub"

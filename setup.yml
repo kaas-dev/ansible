@@ -1,0 +1,287 @@
+---
+# Provision a Colima Ubuntu VM with development toolchains.
+# Usage: cd ansible && ansible-playbook setup.yml
+- name: Configure coding agent sandbox
+  hosts: colima_vms
+  become: false
+  vars:
+    go_tarball: "go{{ go_version }}.linux-{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}.tar.gz"
+    go_url: "https://go.dev/dl/{{ go_tarball }}"
+    node_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'x64' }}"
+
+  tasks:
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: Download GitHub CLI apt keyring
+      ansible.builtin.get_url:
+        url: https://cli.github.com/packages/githubcli-archive-keyring.gpg
+        dest: /etc/apt/keyrings/githubcli-archive-keyring.gpg
+        mode: "0644"
+      become: true
+
+    - name: Add GitHub CLI apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/github-cli.list
+        mode: "0644"
+        content: >-
+          deb [arch={{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }} signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main
+      become: true
+
+    - name: Update apt cache after adding GitHub CLI repository
+      ansible.builtin.apt:
+        update_cache: true
+      become: true
+
+    - name: Install base system packages
+      ansible.builtin.apt:
+        name: "{{ apt_packages }}"
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Install GitHub CLI
+      ansible.builtin.apt:
+        name: gh
+        state: present
+      become: true
+
+    - name: Symlink fd (Ubuntu packages it as fdfind)
+      ansible.builtin.file:
+        src: /usr/bin/fdfind
+        dest: /usr/local/bin/fd
+        state: link
+        force: true
+      become: true
+
+    # --- Python ---
+    - name: Ensure pip is up to date
+      ansible.builtin.pip:
+        name: "{{ python_packages }}"
+        state: present
+        executable: pip3
+        extra_args: --break-system-packages
+      become: true
+
+    # --- Node.js (NodeSource LTS) ---
+    - name: Check if Node.js is installed
+      ansible.builtin.command: node --version
+      register: node_check
+      changed_when: false
+      failed_when: false
+
+    - name: Add NodeSource apt keyring directory
+      ansible.builtin.file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: "0755"
+      become: true
+      when: node_check.rc != 0
+
+    - name: Download NodeSource setup script
+      ansible.builtin.get_url:
+        url: "https://deb.nodesource.com/setup_{{ node_major }}.x"
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+      when: node_check.rc != 0
+
+    - name: Install NodeSource repository
+      ansible.builtin.command: bash /tmp/nodesource_setup.sh
+      become: true
+      when: node_check.rc != 0
+      changed_when: true
+
+    - name: Install Node.js
+      ansible.builtin.apt:
+        name:
+          - nodejs
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Install global npm packages
+      community.general.npm:
+        name: "{{ item }}"
+        global: true
+        state: present
+      loop:
+        - pnpm
+        - yarn
+        - typescript
+        - tsx
+      become: true
+
+    # --- Go ---
+    - name: Check installed Go version
+      ansible.builtin.command: /usr/local/go/bin/go version
+      register: go_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download Go {{ go_version }}
+      ansible.builtin.get_url:
+        url: "{{ go_url }}"
+        dest: "/tmp/{{ go_tarball }}"
+        mode: "0644"
+      when: go_check.rc != 0 or (go_version not in (go_check.stdout | default('')))
+
+    - name: Remove previous Go installation
+      ansible.builtin.file:
+        path: /usr/local/go
+        state: absent
+      become: true
+      when: go_check.rc != 0 or (go_version not in (go_check.stdout | default('')))
+
+    - name: Extract Go to /usr/local
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ go_tarball }}"
+        dest: /usr/local
+        remote_src: true
+      become: true
+      when: go_check.rc != 0 or (go_version not in (go_check.stdout | default('')))
+
+    # --- Rust ---
+    - name: Check if rustup is installed
+      ansible.builtin.stat:
+        path: "{{ home_dir }}/.cargo/bin/rustup"
+      register: rustup_bin
+
+    - name: Download rustup installer
+      ansible.builtin.get_url:
+        url: https://sh.rustup.rs
+        dest: /tmp/rustup-init.sh
+        mode: "0755"
+      when: not rustup_bin.stat.exists
+
+    - name: Install Rust via rustup
+      ansible.builtin.command: >-
+        /tmp/rustup-init.sh -y --default-toolchain stable --profile {{ rust_profile }}
+      args:
+        creates: "{{ home_dir }}/.cargo/bin/rustc"
+      when: not rustup_bin.stat.exists
+
+    - name: Update Rust toolchain
+      ansible.builtin.shell: |
+        source {{ home_dir }}/.cargo/env
+        rustup update stable
+        rustup component add rustfmt clippy
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: rustup_bin.stat.exists
+
+    # --- Herdr ---
+    - name: Check if herdr is installed
+      ansible.builtin.command: herdr --version
+      environment:
+        PATH: "{{ home_dir }}/.local/bin:/usr/local/bin:{{ ansible_facts['env']['PATH'] }}"
+      register: herdr_check
+      changed_when: false
+      failed_when: false
+      when: install_herdr | bool
+
+    - name: Install Herdr (agent runtime multiplexer)
+      ansible.builtin.shell: curl -fsSL https://herdr.dev/install.sh | sh
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "{{ home_dir }}"
+        PATH: "{{ home_dir }}/.local/bin:{{ ansible_facts['env']['PATH'] }}"
+      when: install_herdr | bool and herdr_check.rc != 0
+      changed_when: true
+
+    # --- Shell environment ---
+    - name: Ensure profile.d directory exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.profile.d"
+        state: directory
+        mode: "0755"
+
+    - name: Install toolchain PATH snippet
+      ansible.builtin.copy:
+        dest: "{{ profile_snippet }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible — development toolchains
+          export AGENT_ENV="active"
+
+          # Go
+          export GOROOT=/usr/local/go
+          export GOPATH="$HOME/go"
+          export PATH="$GOROOT/bin:$GOPATH/bin:$PATH"
+
+          # Rust
+          [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+          # Local bins (pip --user, npm, etc.)
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Useful defaults
+          export EDITOR="${EDITOR:-vim}"
+          export LANG="${LANG:-en_US.UTF-8}"
+
+    - name: Source toolchain snippet from .bashrc
+      ansible.builtin.blockinfile:
+        path: "{{ bashrc_path }}"
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED DEV TOOLCHAINS"
+        block: |
+          if [ -f "$HOME/.profile.d/dev-toolchains.sh" ]; then
+            . "$HOME/.profile.d/dev-toolchains.sh"
+          fi
+
+    - name: Source toolchain snippet from .profile
+      ansible.builtin.blockinfile:
+        path: "{{ home_dir }}/.profile"
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED DEV TOOLCHAINS"
+        block: |
+          if [ -f "$HOME/.profile.d/dev-toolchains.sh" ]; then
+            . "$HOME/.profile.d/dev-toolchains.sh"
+          fi
+
+    - name: Create Go workspace
+      ansible.builtin.file:
+        path: "{{ home_dir }}/go/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - bin
+        - pkg
+        - src
+
+    - name: Verify installed toolchains
+      ansible.builtin.shell: |
+        set -e
+        . {{ profile_snippet }}
+        echo "python: $(python3 --version)"
+        echo "pip:    $(pip3 --version)"
+        echo "node:   $(node --version)"
+        echo "npm:    $(npm --version)"
+        echo "go:     $(go version)"
+        echo "rustc:  $(rustc --version)"
+        echo "cargo:  $(cargo --version)"
+        echo "git:    $(git --version)"
+        echo "gh:     $(gh --version | head -n1)"
+        echo "herdr:  $(herdr --version 2>/dev/null || echo 'not installed')"
+      args:
+        executable: /bin/bash
+      register: toolchain_versions
+      changed_when: false
+
+    - name: Print toolchain versions
+      ansible.builtin.debug:
+        var: toolchain_versions.stdout_lines

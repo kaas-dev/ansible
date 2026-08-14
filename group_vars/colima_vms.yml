@@ -1,0 +1,3 @@
+---
+# Colima SSH user matches the macOS username (Lima default)
+ansible_user: "{{ lookup('env', 'USER') }}"
